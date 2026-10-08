@@ -1,0 +1,748 @@
+import socket
+import struct
+import csv
+import os
+import time
+
+import srtp_message
+
+
+# ============================================================
+# CONFIGURACION
+# ============================================================
+
+ROBOT_IP = "127.0.0.1"
+PORT = 18245
+
+# Primer registro FANUC
+REGISTRO_INICIAL = 1
+
+
+# ============================================================
+# ARCHIVO CSV
+#
+# MATLAB debe generar:
+#
+# waypoints_1.csv
+#
+# en esta misma carpeta
+# ============================================================
+
+CARPETA_ACTUAL = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+ARCHIVO_CSV = os.path.join(
+    CARPETA_ACTUAL,
+    "waypoints_1.csv"
+)
+
+
+# ============================================================
+# CONEXION SNPX
+# ============================================================
+
+def open_socket(robot_ip, snpx_port):
+
+    s = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM
+    )
+
+    print("========================================")
+    print("          CONEXION SNPX")
+    print("========================================")
+
+    print(
+        f"Conectando a {robot_ip}:{snpx_port}..."
+    )
+
+    s.connect(
+        (robot_ip, snpx_port)
+    )
+
+    # Mensaje inicial SNPX
+    s.send(
+        srtp_message.INIT_MSG
+    )
+
+    init_resp = s.recv(1024)
+
+    if len(init_resp) == 0:
+
+        s.close()
+
+        raise Exception(
+            "El FANUC no respondio al INIT SNPX."
+        )
+
+    if init_resp[0] != 1:
+
+        s.close()
+
+        raise Exception(
+            f"Respuesta INIT incorrecta: "
+            f"{init_resp[0]}"
+        )
+
+
+    # Verificar comunicacion
+    init_comm = read_mem(
+        0,
+        "R",
+        s
+    )
+
+    if init_comm == 256:
+
+        print("Conexion SNPX correcta.\n")
+
+        return s
+
+
+    s.close()
+
+    raise Exception(
+        f"Error de comunicacion SNPX: "
+        f"{init_comm}"
+    )
+
+
+# ============================================================
+# LEER MEMORIA
+# ============================================================
+
+def read_mem(addr, reg, s, size=1):
+
+    msg = srtp_message.BASE_MSG.copy()
+
+    msg[42] = (
+        srtp_message
+        .SERVICE_REQUEST_CODE[
+            "READ_SYS_MEMORY"
+        ]
+    )
+
+    msg[43] = (
+        srtp_message
+        .MEMORY_TYPE_CODE[reg]
+    )
+
+
+    # ========================================================
+    # DIRECCION
+    # ========================================================
+
+    if addr > 0:
+
+        msg[44] = int(
+            ((addr - 1) // 8) & 255
+        ).to_bytes(
+            1,
+            byteorder="big"
+        )
+
+
+        if reg in ["AI", "R"] or size > 1:
+
+            msg[44] = int(
+                (addr - 1) & 255
+            ).to_bytes(
+                1,
+                byteorder="big"
+            )
+
+
+        msg[45] = int(
+            (addr - 1) >> 8
+        ).to_bytes(
+            1,
+            byteorder="big"
+        )
+
+
+    msg[46] = int(
+        size
+    ).to_bytes(
+        1,
+        byteorder="big"
+    )
+
+
+    # ========================================================
+    # ENVIAR
+    # ========================================================
+
+    out_bytes = b"".join(msg)
+
+    s.send(out_bytes)
+
+    response = s.recv(1024)
+
+
+    if len(response) == 0:
+
+        raise Exception(
+            "FANUC no respondio durante lectura."
+        )
+
+
+    # ========================================================
+    # LECTURA INICIAL
+    # ========================================================
+
+    if addr == 0:
+
+        if len(response) < 49:
+
+            raise Exception(
+                "Respuesta inicial SNPX incompleta."
+            )
+
+        return struct.unpack(
+            "<H",
+            bytearray(
+                response[47:49]
+            )
+        )[0]
+
+
+    return response
+
+
+# ============================================================
+# ESCRIBIR REGISTRO FANUC
+# ENTERO SIGNED 16 BITS
+# ============================================================
+
+def write_register_int(
+    registro,
+    valor,
+    sock
+):
+
+    valor = int(
+        round(valor)
+    )
+
+
+    # Verificar limites
+    if valor < -32768 or valor > 32767:
+
+        raise ValueError(
+            f"El valor {valor} no entra "
+            f"en 16 bits."
+        )
+
+
+    msg = srtp_message.BASE_MSG.copy()
+
+    var_length = 2
+
+
+    # ========================================================
+    # CONFIGURAR WRITE
+    # ========================================================
+
+    msg[4] = var_length.to_bytes(
+        1,
+        byteorder="big"
+    )
+
+    msg[9] = b"\x02"
+    msg[17] = b"\x02"
+
+    msg[30] = b"\x09"
+    msg[31] = b"\x80"
+
+    msg[42] = var_length.to_bytes(
+        1,
+        byteorder="big"
+    )
+
+    msg[48] = b"\x01"
+    msg[49] = b"\x01"
+
+
+    msg[50] = (
+        srtp_message
+        .SERVICE_REQUEST_CODE[
+            "WRITE_SYS_MEMORY"
+        ]
+    )
+
+
+    msg[51] = (
+        srtp_message
+        .MEMORY_TYPE_CODE["R"]
+    )
+
+
+    # ========================================================
+    # DIRECCION DEL REGISTRO
+    # ========================================================
+
+    addr = registro
+
+
+    msg[52] = int(
+        (addr - 1) & 255
+    ).to_bytes(
+        1,
+        byteorder="big"
+    )
+
+
+    msg[53] = int(
+        (addr - 1) >> 8
+    ).to_bytes(
+        1,
+        byteorder="big"
+    )
+
+
+    # Un WORD
+    msg[54] = b"\x01"
+
+
+    # ========================================================
+    # AGREGAR VALOR
+    # ========================================================
+
+    msg.append(
+        struct.pack(
+            "<h",
+            valor
+        )
+    )
+
+
+    # ========================================================
+    # ENVIAR
+    # ========================================================
+
+    out_bytes = b"".join(msg)
+
+    sock.send(out_bytes)
+
+    response = sock.recv(1024)
+
+
+    if len(response) == 0:
+
+        raise Exception(
+            f"No hubo respuesta escribiendo "
+            f"R[{registro}]"
+        )
+
+
+    return response
+
+
+# ============================================================
+# DECODIFICAR ENTERO
+# ============================================================
+
+def decode_integer(response):
+
+    if len(response) < 46:
+
+        raise Exception(
+            "Respuesta demasiado corta."
+        )
+
+
+    return struct.unpack(
+        "<h",
+        bytearray(
+            response[44:46]
+        )
+    )[0]
+
+
+# ============================================================
+# ESCRIBIR Y VERIFICAR REGISTRO
+# ============================================================
+
+def modificar_registro(
+    sock,
+    registro,
+    valor
+):
+
+    valor_int = int(
+        round(valor)
+    )
+
+
+    # Escribir
+    write_register_int(
+        registro,
+        valor_int,
+        sock
+    )
+
+
+    time.sleep(0.10)
+
+
+    # Leer nuevamente
+    respuesta = read_mem(
+        registro,
+        "R",
+        sock,
+        1
+    )
+
+
+    valor_leido = decode_integer(
+        respuesta
+    )
+
+
+    if valor_leido == valor_int:
+
+        print(
+            f"R[{registro}] = "
+            f"{valor_leido}   OK"
+        )
+
+    else:
+
+        print(
+            f"R[{registro}] = "
+            f"{valor_leido}   "
+            f"ERROR, esperaba {valor_int}"
+        )
+
+
+    return valor_leido
+
+
+# ============================================================
+# LEER WAYPOINTS_1.CSV
+# ============================================================
+
+def leer_waypoints_csv():
+
+    print("========================================")
+    print("       LEER WAYPOINTS_1.CSV")
+    print("========================================")
+
+
+    print(
+        f"Archivo:\n"
+        f"{ARCHIVO_CSV}\n"
+    )
+
+
+    # Verificar archivo
+    if not os.path.isfile(
+        ARCHIVO_CSV
+    ):
+
+        raise FileNotFoundError(
+            f"No existe:\n"
+            f"{ARCHIVO_CSV}"
+        )
+
+
+    waypoints = []
+
+
+    # ========================================================
+    # ABRIR CSV
+    # ========================================================
+
+    with open(
+        ARCHIVO_CSV,
+        "r",
+        newline="",
+        encoding="utf-8"
+    ) as archivo:
+
+
+        lector = csv.reader(
+            archivo
+        )
+
+
+        for fila in lector:
+
+
+            if not fila:
+                continue
+
+
+            if len(fila) < 3:
+                continue
+
+
+            try:
+
+                x = float(
+                    fila[0]
+                )
+
+                y = float(
+                    fila[1]
+                )
+
+                z = float(
+                    fila[2]
+                )
+
+
+            except ValueError:
+
+                # Ignorar cabecera
+                continue
+
+
+            waypoints.append(
+                [
+                    x,
+                    y,
+                    z
+                ]
+            )
+
+
+    # ========================================================
+    # COMPROBAR
+    # ========================================================
+
+    if len(waypoints) == 0:
+
+        raise Exception(
+            "waypoints_1.csv no contiene "
+            "coordenadas validas."
+        )
+
+
+    # ========================================================
+    # MOSTRAR WAYPOINTS
+    # ========================================================
+
+    print(
+        f"Numero de puntos: "
+        f"{len(waypoints)}"
+    )
+
+    print()
+
+
+    for i, punto in enumerate(
+        waypoints,
+        start=1
+    ):
+
+        print(
+            f"P{i} = "
+            f"["
+            f"{punto[0]:.3f}, "
+            f"{punto[1]:.3f}, "
+            f"{punto[2]:.3f}"
+            f"]"
+        )
+
+
+    print()
+
+
+    return waypoints
+
+
+# ============================================================
+# ENVIAR WAYPOINTS A REGISTROS
+# ============================================================
+
+def enviar_waypoints(
+    sock,
+    waypoints
+):
+
+    print("========================================")
+    print("      ENVIANDO PUNTOS AL FANUC")
+    print("========================================")
+
+
+    registro = REGISTRO_INICIAL
+
+
+    for numero_punto, punto in enumerate(
+        waypoints,
+        start=1
+    ):
+
+
+        x = int(
+            round(punto[0])
+        )
+
+        y = int(
+            round(punto[1])
+        )
+
+        z = int(
+            round(punto[2])
+        )
+
+
+        print()
+        print("----------------------------------------")
+
+        print(
+            f"P{numero_punto} = "
+            f"[{x}, {y}, {z}]"
+        )
+
+        print("----------------------------------------")
+
+
+        # ====================================================
+        # X
+        # ====================================================
+
+        print(
+            f"X -> R[{registro}]"
+        )
+
+        modificar_registro(
+            sock,
+            registro,
+            x
+        )
+
+        registro += 1
+
+
+        # ====================================================
+        # Y
+        # ====================================================
+
+        print(
+            f"Y -> R[{registro}]"
+        )
+
+        modificar_registro(
+            sock,
+            registro,
+            y
+        )
+
+        registro += 1
+
+
+        # ====================================================
+        # Z
+        # ====================================================
+
+        print(
+            f"Z -> R[{registro}]"
+        )
+
+        modificar_registro(
+            sock,
+            registro,
+            z
+        )
+
+        registro += 1
+
+
+    # ========================================================
+    # RESUMEN
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("      WAYPOINTS ENVIADOS")
+    print("========================================")
+
+
+    print(
+        f"Numero de puntos: "
+        f"{len(waypoints)}"
+    )
+
+
+    print(
+        f"Registros usados: "
+        f"R[{REGISTRO_INICIAL}] "
+        f"hasta R[{registro - 1}]"
+    )
+
+
+    print("========================================")
+
+
+# ============================================================
+# PROGRAMA PRINCIPAL
+# ============================================================
+
+if __name__ == "__main__":
+
+    sock = None
+
+
+    try:
+
+        # ====================================================
+        # 1. LEER waypoints_1.csv
+        # ====================================================
+
+        waypoints = (
+            leer_waypoints_csv()
+        )
+
+
+        # ====================================================
+        # 2. CONECTAR AL FANUC
+        # ====================================================
+
+        sock = open_socket(
+            ROBOT_IP,
+            PORT
+        )
+
+
+        # ====================================================
+        # 3. ENVIAR A REGISTROS
+        # ====================================================
+
+        enviar_waypoints(
+            sock,
+            waypoints
+        )
+
+
+    except Exception as e:
+
+        print()
+        print("========================================")
+        print("                 ERROR")
+        print("========================================")
+
+        print(e)
+
+        print("========================================")
+
+
+    finally:
+
+        if sock is not None:
+
+            try:
+
+                sock.close()
+
+            except Exception:
+
+                pass
+
+
+            print()
+            print(
+                "Conexion SNPX cerrada."
+            )
